@@ -260,11 +260,23 @@ There are a number of delays which can be changed with the following kernel boot
 - `bpr_attempts` (BrcmPatchRAM3 only): Number of firmware upload attempts per start (1-10). Default value is `3`.
 - `bpr_steptimeout` (BrcmPatchRAM3 only): Time in ms to wait for a single reply of the device before the attempt is aborted (500-60000). Default value is `3000`.
 - `bpr_hide` (BrcmPatchRAM3 only): `1` keeps the USB interfaces unregistered, so that `bluetoothd` cannot talk to the chip while firmware is being uploaded, and registers them afterwards. `0` restores the old behaviour. Default value is `1`.
-- `bpr_wakeprobe` (BrcmPatchRAM3 only): `1` sends a harmless USB `GET_STATUS` to the device a few seconds after every wake and resets the USB port (re-enumerating the device and reloading the firmware) if it does not answer. This drops a Bluetooth session that is working only in the sense that the chip is already dead. Default value is `1`.
+- `bpr_wakeprobe` (BrcmPatchRAM3 only): `1` sends a harmless USB `GET_STATUS` to the device about 2.5 seconds after a wake. If the device does not answer twice in a row (1 second apart), the USB port is reset, which re-enumerates the device and reloads the firmware. This only applies when the device survives the sleep; if it is re-enumerated by the system anyway, the driver simply starts again and uploads the firmware. At most 3 such resets are done in a row; a passing probe, or 10 minutes without a reset, clears the count. Default value is `1`.
 - `bpr_portreset` (BrcmPatchRAM3 only): `1` also resets the USB port if every firmware upload attempt failed. Default value is `0`.
 - `bpr_testprobefail` (BrcmPatchRAM3 only, testing): `1` makes the wake probe always report a dead device and runs it about 8 seconds after every driver start (self test of the probe and USB reset path). Expect up to 3 Bluetooth restarts in a row, then the driver gives up and leaves Bluetooth running; check `BPR-LastProbe` and `BPR-LastAction`. Default value is `0`.
 
-BrcmPatchRAM3 publishes its state as properties on its IORegistry entry, readable without root: `ioreg -l -w0 | grep BPR-` (`BPR-Config`, `BPR-LastUpload`, `BPR-LastPower`, `BPR-LastProbe`, `BPR-LastAction`, `BPR-LastReveal`).
+BrcmPatchRAM3 publishes its state as properties on its IORegistry entry, readable without root: `ioreg -l -w0 | grep BPR-`. This is the way to see what the driver did, since its kernel log lines do not show up in the unified log.
+
+| Property | Meaning |
+| --- | --- |
+| `BPR-Config` | Effective settings of this boot |
+| `BPR-LastUpload` | Result of the last firmware upload (attempt, uptime) |
+| `BPR-LastReveal` | When the USB interfaces were handed to the Bluetooth stack |
+| `BPR-LastPower` | Last power state change seen by the driver (ON/OFF, uptime) |
+| `BPR-LastProbe` | Result of the last wake probe (`alive`, `DEAD`, `inconclusive`); only present after a probe ran |
+| `BPR-LastAction` | Last USB reset requested or refused, with the reason |
+| `BPR-LastSelfTest` | Only with `bpr_testprobefail=1`: when the self test was scheduled |
+
+The uptime values count the time the Mac was awake, not the time spent asleep.
 
 For example, to change `mPostResetDelay` to 400 ms, use the kernel boot argument: `bpr_postresetdelay=400`.
 
@@ -313,6 +325,17 @@ Verify any errors in the system log by running the following command in the term
 Ensure you check only the latest boot messages, as the system.log might go back several days.
 
 If the firmware upload failed with an error, try installing the debug version of BrcmPatchRAM in order to get more detailed information in the log.
+
+#### Bluetooth breaks after sleep (BrcmPatchRAM3)
+
+Many Broadcom USB controllers lose power during sleep and are enumerated again on wake, so the firmware has to be uploaded again every time. Two things can go wrong:
+
+ * `bluetoothd` is already running and talks to the chip while the firmware is being uploaded. `bpr_hide` (on by default) prevents this by keeping the USB interfaces hidden until the upload is done.
+ * The chip is not re-enumerated but does not answer after the wake. `bpr_wakeprobe` (on by default) detects this and resets the USB port.
+
+If Bluetooth is broken, run `ioreg -l -w0 | grep BPR-` **before** restarting and include the output in an issue. `BPR-LastUpload` tells whether the upload worked, `BPR-LastProbe` and `BPR-LastAction` tell whether the wake probe found a dead device and what was done about it.
+
+To test the probe and reset path, add `bpr_testprobefail=1` to the boot arguments and reboot without sleeping. Bluetooth restarts three times within about 30 seconds, then `BPR-LastAction` reads `reset refused ... limit reached` and Bluetooth stays up. Remove the argument afterwards.
 
 In order to report an error log an issue on github with the following information:
 

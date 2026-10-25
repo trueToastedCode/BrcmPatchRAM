@@ -5,6 +5,7 @@ BrcmPatchRAM Changelog
 - BrcmPatchRAM3: keep USB interfaces unregistered during the firmware upload so `bluetoothd` cannot interfere (`bpr_hide`)
 - BrcmPatchRAM3: check the device after wake and re-enumerate it if it is dead (`bpr_wakeprobe`)
 - BrcmPatchRAM3: publish state as `BPR-*` IORegistry properties
+- BrcmPatchRAM3: limit USB port resets to 3 in a row (cleared by a passing probe or 10 minutes), `bpr_testprobefail=1` runs the probe and reset path as a self test
 
 #### v2.7.2
 - Added `bluetoothd` patches for macOS 26 (thx @spotlightishere et al)
