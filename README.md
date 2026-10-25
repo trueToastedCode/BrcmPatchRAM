@@ -262,7 +262,7 @@ There are a number of delays which can be changed with the following kernel boot
 - `bpr_hide` (BrcmPatchRAM3 only): `1` keeps the USB interfaces unregistered, so that `bluetoothd` cannot talk to the chip while firmware is being uploaded, and registers them afterwards. `0` restores the old behaviour. Default value is `1`.
 - `bpr_wakeprobe` (BrcmPatchRAM3 only): `1` sends a harmless USB `GET_STATUS` to the device a few seconds after every wake and resets the USB port (re-enumerating the device and reloading the firmware) if it does not answer. This drops a Bluetooth session that is working only in the sense that the chip is already dead. Default value is `1`.
 - `bpr_portreset` (BrcmPatchRAM3 only): `1` also resets the USB port if every firmware upload attempt failed. Default value is `0`.
-- `bpr_testprobefail` (BrcmPatchRAM3 only, testing): `1` makes the wake probe always report a dead device, to exercise the recovery path after the next wake. Default value is `0`.
+- `bpr_testprobefail` (BrcmPatchRAM3 only, testing): `1` makes the wake probe always report a dead device and runs it about 8 seconds after every driver start (self test of the probe and USB reset path). Expect up to 3 Bluetooth restarts in a row, then the driver gives up and leaves Bluetooth running; check `BPR-LastProbe` and `BPR-LastAction`. Default value is `0`.
 
 BrcmPatchRAM3 publishes its state as properties on its IORegistry entry, readable without root: `ioreg -l -w0 | grep BPR-` (`BPR-Config`, `BPR-LastUpload`, `BPR-LastPower`, `BPR-LastProbe`, `BPR-LastAction`, `BPR-LastReveal`).
 

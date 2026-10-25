@@ -350,6 +350,19 @@ bool BrcmPatchRAM::start(IOService *provider)
         }
     }
 
+    /*
+     * Self test (bpr_testprobefail=1): a driver instance that was just started never
+     * sees a power ON callback after its upload, so the wake probe would not run at all.
+     * Schedule it once here so the whole probe -> reset path can be exercised on demand.
+     * The static reset counter bounds this to kMaxPortResets restarts in a row.
+     */
+    if (mUploadOk && mTestProbeFail && mWakeTimer) {
+        AlwaysLog("[%04x:%04x]: Self test: wake probe scheduled in %u ms.\n", mVendorId, mProductId, 8000);
+        publishStatus("BPR-LastSelfTest", "probe scheduled at uptime %llu ms", uptimeMs());
+        mWakeCheckRetries = 0;
+        mWakeTimer->setTimeoutMS(8000);
+    }
+
     success = true;
     goto done;
     
