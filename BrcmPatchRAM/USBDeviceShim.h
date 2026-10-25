@@ -63,6 +63,7 @@ public:
     UInt16 getDeviceRelease();
     IOReturn getDeviceStatus(IOService* forClient, USBStatus *status);
     IOReturn resetDevice();
+    IOReturn reEnumerate();  // USB port reset; device is terminated and re-created (host stack only)
     UInt8 getNumConfigurations();
     const USBCONFIGURATIONDESCRIPTOR* getFullConfigurationDescriptor(UInt8 configIndex);
     IOReturn getConfiguration(IOService* forClient, UInt8 *configNumber);

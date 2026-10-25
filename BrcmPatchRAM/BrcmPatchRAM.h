@@ -112,7 +112,33 @@ private:
     volatile DeviceState mDeviceState = kInitialize;
     volatile uint16_t mFirmwareVersion = 0xFFFF;
     IOLock* mCompletionLock = NULL;
-    
+
+#ifdef TARGET_CATALINA
+    /*
+     * Robustness additions (BrcmPatchRAM3 only):
+     *  - bounded waits for device replies (mStepTimeout)
+     *  - several upload attempts per start (mMaxAttempts)
+     *  - delayed background recovery if every attempt failed
+     *  - optional USB re-enumeration as a last resort (mAllowPortReset)
+     */
+    UInt32 mMaxAttempts = 3;
+    UInt32 mStepTimeout = 3000;          // ms to wait for one device reply
+    bool mAllowPortReset = false;        // boot-arg bpr_portreset=1
+    volatile bool mReadDone = false;     // set by readCompletion, protected by mCompletionLock
+    volatile bool mUploadOk = false;     // result of the most recent upload run
+    volatile bool mShuttingDown = false;
+    volatile bool mResetIssued = false;  // USB re-enumeration requested; device will go away
+    UInt32 mRecoveryRound = 0;
+    IOWorkLoop* mRecoveryLoop = NULL;
+    IOTimerEventSource* mRecoveryTimer = NULL;
+    IOLock* mUploadLock = NULL;          // serialises start()/recovery uploads
+
+    bool uploadFirmwareOnce();
+    bool uploadWithRetries();
+    void scheduleRecovery(UInt32 delayMs);
+    void recoveryTimerFired(IOTimerEventSource* sender);
+#endif
+
 #ifdef DEBUG
     static const char* getState(DeviceState deviceState);
 #endif

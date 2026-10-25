@@ -113,6 +113,15 @@ IOReturn USBDeviceShim::resetDevice()
     return kIOReturnSuccess;
 }
 
+IOReturn USBDeviceShim::reEnumerate()
+{
+    if (!m_pDevice)
+        return kIOReturnNoDevice;
+    // Resets the port. The IOUSBHostDevice is torn down and re-enumerated,
+    // which makes the driver match and start again from scratch.
+    return m_pDevice->reset();
+}
+
 UInt8 USBDeviceShim::getNumConfigurations()
 {
     return m_pDevice->getDeviceDescriptor()->bNumConfigurations;

@@ -40,6 +40,33 @@
 
 #define kReadBufferSize 0x200
 
+#include <kern/clock.h>
+
+#ifndef THREAD_UNINT
+#define THREAD_UNINT 0
+#endif
+#ifndef THREAD_TIMED_OUT
+#define THREAD_TIMED_OUT 1
+#endif
+#ifndef kMillisecondScale
+#define kMillisecondScale 1000000
+#endif
+
+// Background recovery: delays (ms) before each retry round after a failed upload.
+static const UInt32 kRecoveryBackoffMs[] = { 5000, 15000, 45000 };
+#define kMaxRecoveryRounds (sizeof(kRecoveryBackoffMs) / sizeof(kRecoveryBackoffMs[0]))
+// Upper bound for consecutive forced USB re-enumerations without a successful upload.
+#define kMaxPortResets 3
+static UInt32 sPortResets = 0;
+
+static uint64_t uptimeMs()
+{
+    uint64_t now, ns;
+    clock_get_uptime(&now);
+    absolutetime_to_nanoseconds(now, &ns);
+    return ns / 1000000;
+}
+
 //////////////////////////////////////////////////////////////////////////////////////////////////
 
 enum { kMyOffPowerState = 0, kMyOnPowerState = 1 };
@@ -115,6 +142,21 @@ bool BrcmPatchRAM::init(OSDictionary *properties)
         
         if (PE_parse_boot_argn("bpr_preresetdelay", &delay, sizeof delay))
             mPreResetDelay = delay;
+
+        // Number of upload attempts per start (1..10).
+        mMaxAttempts = 3;
+        if (PE_parse_boot_argn("bpr_attempts", &delay, sizeof delay))
+            mMaxAttempts = delay < 1 ? 1 : (delay > 10 ? 10 : delay);
+
+        // How long to wait for a single device reply before giving up on the attempt (ms).
+        mStepTimeout = 3000;
+        if (PE_parse_boot_argn("bpr_steptimeout", &delay, sizeof delay))
+            mStepTimeout = delay < 500 ? 500 : (delay > 60000 ? 60000 : delay);
+
+        // Last resort: reset the USB port if all attempts failed. Off by default.
+        mAllowPortReset = false;
+        if (PE_parse_boot_argn("bpr_portreset", &delay, sizeof delay))
+            mAllowPortReset = delay != 0;
     }
     return result;
 }
@@ -209,9 +251,10 @@ bool BrcmPatchRAM::start(IOService *provider)
     makeUsable();
     
     mCompletionLock = IOLockAlloc();
-    
-    if (!mCompletionLock)
-        goto error1;
+    mUploadLock = IOLockAlloc();
+
+    if (!mCompletionLock || !mUploadLock)
+        goto error2;
 
     /*
      * Setup and prepare read buffer now as it can be reused and
@@ -234,8 +277,38 @@ bool BrcmPatchRAM::start(IOService *provider)
     /* Reset the device to put it in a defined state. */
     mDevice.setDevice(provider);
 
-    uploadFirmware();
-    
+    /*
+     * Own work loop + timer used for background recovery after a failed
+     * upload. Failing to create them is not fatal, recovery is just disabled.
+     */
+    mShuttingDown = false;
+    mResetIssued = false;
+    mRecoveryRound = 0;
+    mRecoveryLoop = IOWorkLoop::workLoop();
+    if (mRecoveryLoop) {
+        mRecoveryTimer = IOTimerEventSource::timerEventSource(this,
+            OSMemberFunctionCast(IOTimerEventSource::Action, this, &BrcmPatchRAM::recoveryTimerFired));
+        if (!mRecoveryTimer || mRecoveryLoop->addEventSource(mRecoveryTimer) != kIOReturnSuccess) {
+            AlwaysLog("[%04x:%04x]: Unable to set up recovery timer, background recovery disabled.\n", mVendorId, mProductId);
+            OSSafeReleaseNULL(mRecoveryTimer);
+            OSSafeReleaseNULL(mRecoveryLoop);
+        }
+    }
+
+    IOLockLock(mUploadLock);
+    mUploadOk = uploadWithRetries();
+    IOLockUnlock(mUploadLock);
+
+    if (!mUploadOk) {
+        if (mResetIssued) {
+            AlwaysLog("[%04x:%04x]: Firmware upload failed, USB re-enumeration requested.\n", mVendorId, mProductId);
+        } else {
+            AlwaysLog("[%04x:%04x]: Firmware upload failed, will retry in background in %u ms.\n",
+                      mVendorId, mProductId, kRecoveryBackoffMs[0]);
+            scheduleRecovery(kRecoveryBackoffMs[0]);
+        }
+    }
+
     success = true;
     goto done;
     
@@ -252,8 +325,14 @@ error3:
     OSSafeReleaseNULL(mReadBuffer);
 
 error2:
-    IOLockFree(mCompletionLock);
-    mCompletionLock = NULL;
+    if (mCompletionLock) {
+        IOLockFree(mCompletionLock);
+        mCompletionLock = NULL;
+    }
+    if (mUploadLock) {
+        IOLockFree(mUploadLock);
+        mUploadLock = NULL;
+    }
     
 error1:
     PMstop();
@@ -271,8 +350,22 @@ done:
 void BrcmPatchRAM::stop(IOService* provider)
 {
     DebugLog("stop\n");
-    
+
+    mShuttingDown = true;
     PMstop();
+
+    /*
+     * Tear down background recovery first. removeEventSource() waits for a
+     * running timer action (possibly an upload in progress), which fails
+     * quickly once the device is gone.
+     */
+    if (mRecoveryTimer) {
+        mRecoveryTimer->cancelTimeout();
+        if (mRecoveryLoop)
+            mRecoveryLoop->removeEventSource(mRecoveryTimer);
+        OSSafeReleaseNULL(mRecoveryTimer);
+    }
+    OSSafeReleaseNULL(mRecoveryLoop);
 
     OSSafeReleaseNULL(mFirmwareStore);
 
@@ -288,7 +381,11 @@ void BrcmPatchRAM::stop(IOService* provider)
         IOLockFree(mCompletionLock);
         mCompletionLock = NULL;
     }
-    
+    if (mUploadLock) {
+        IOLockFree(mUploadLock);
+        mUploadLock = NULL;
+    }
+
     /* Release device. */
     mDevice.setDevice(NULL);
     
@@ -301,28 +398,120 @@ void BrcmPatchRAM::stop(IOService* provider)
  */
 IOReturn BrcmPatchRAM::setPowerState(unsigned long which, IOService *whom)
 {
-    DebugLog("setPowerState: which = 0x%lx\n", which);
-    
-    if (which == kMyOffPowerState) {
-        
-    } else if (which == kMyOnPowerState) {
-        
+    AlwaysLog("[%04x:%04x]: power state %s (uptime %llu ms, firmware upload %s)\n",
+              mVendorId, mProductId,
+              which == kMyOnPowerState ? "ON" : "OFF",
+              uptimeMs(),
+              mUploadOk ? "ok" : "not ok");
+
+    if (which == kMyOnPowerState) {
+        /*
+         * Never touch the device here, this runs on the power management thread
+         * and a working controller must not be disturbed. Only if the last upload
+         * failed, schedule a (fresh) background recovery.
+         */
+        if (!mUploadOk && !mResetIssued && !mShuttingDown) {
+            mRecoveryRound = 0;
+            scheduleRecovery(3000);
+        }
     }
     return IOPMAckImplied;
 }
 
-void BrcmPatchRAM::uploadFirmware()
+void BrcmPatchRAM::scheduleRecovery(UInt32 delayMs)
 {
+    if (mShuttingDown || !mRecoveryTimer)
+        return;
+    mRecoveryTimer->setTimeoutMS(delayMs);
+}
+
+void BrcmPatchRAM::recoveryTimerFired(IOTimerEventSource*)
+{
+    if (mShuttingDown || mUploadOk || mResetIssued || !mUploadLock)
+        return;
+
+    // start() (or an earlier round) may still be uploading, try again shortly.
+    if (!IOLockTryLock(mUploadLock)) {
+        scheduleRecovery(1000);
+        return;
+    }
+
+    if (!mDevice.getValidatedDevice() || !mCompletionLock) {
+        IOLockUnlock(mUploadLock);
+        return;
+    }
+
+    mRecoveryRound++;
+    AlwaysLog("[%04x:%04x]: Background recovery round %u/%u (uptime %llu ms).\n",
+              mVendorId, mProductId, mRecoveryRound, (unsigned)kMaxRecoveryRounds, uptimeMs());
+
+    bool ok = uploadWithRetries();
+    mUploadOk = ok;
+    IOLockUnlock(mUploadLock);
+
+    if (ok) {
+        AlwaysLog("[%04x:%04x]: Background recovery succeeded.\n", mVendorId, mProductId);
+    } else if (!mResetIssued && !mShuttingDown) {
+        if (mRecoveryRound < kMaxRecoveryRounds) {
+            UInt32 next = kRecoveryBackoffMs[mRecoveryRound];
+            AlwaysLog("[%04x:%04x]: Background recovery failed, next round in %u ms.\n", mVendorId, mProductId, next);
+            scheduleRecovery(next);
+        } else {
+            AlwaysLog("[%04x:%04x]: Background recovery gave up; will try again on next wake.\n", mVendorId, mProductId);
+        }
+    }
+}
+
+bool BrcmPatchRAM::uploadWithRetries()
+{
+    for (UInt32 attempt = 1; attempt <= mMaxAttempts; attempt++) {
+        if (mShuttingDown)
+            return false;
+
+        uint64_t t0 = uptimeMs();
+
+        if (uploadFirmwareOnce()) {
+            if (attempt > 1)
+                AlwaysLog("[%04x:%04x]: Upload succeeded on attempt %u/%u.\n", mVendorId, mProductId, attempt, mMaxAttempts);
+            sPortResets = 0;
+            return true;
+        }
+
+        AlwaysLog("[%04x:%04x]: Upload attempt %u/%u failed after %llu ms (state %d).\n",
+                  mVendorId, mProductId, attempt, mMaxAttempts, uptimeMs() - t0, (int)mDeviceState);
+
+        if (attempt < mMaxAttempts)
+            IOSleep(500 * attempt + mPostResetDelay);
+    }
+
+    if (mAllowPortReset && !mShuttingDown && sPortResets < kMaxPortResets && mDevice.getValidatedDevice()) {
+        sPortResets++;
+        AlwaysLog("[%04x:%04x]: All attempts failed, forcing USB re-enumeration (%u/%u).\n",
+                  mVendorId, mProductId, sPortResets, kMaxPortResets);
+        mResetIssued = true;
+        IOReturn result = mDevice.reEnumerate();
+        if (result != kIOReturnSuccess) {
+            mResetIssued = false;
+            AlwaysLog("[%04x:%04x]: USB re-enumeration failed (\"%s\" 0x%08x).\n", mVendorId, mProductId, stringFromReturn(result), result);
+        }
+    }
+    return false;
+}
+
+bool BrcmPatchRAM::uploadFirmwareOnce()
+{
+    bool ok = false;
+
     // signal to timer that firmware already loaded
     mDevice.setProperty(kFirmwareLoaded, true);
-    
+
     // don't bother with devices that have no firmware
     if (!getProperty(kFirmwareKey))
-        return;
-    
+        return true;
+
     if (!mDevice.open(this)) {
-        AlwaysLog("uploadFirmware could not open the device!\n");
-        return;
+        AlwaysLog("[%04x:%04x]: uploadFirmware could not open the device!\n", mVendorId, mProductId);
+        return false;
     }
     
     // Print out additional device information
@@ -339,6 +528,7 @@ void BrcmPatchRAM::uploadFirmware()
             DebugLog("got pipes\n");
             
             if (performUpgrade()) {
+                ok = true;
                 if (mDeviceState == kUpdateComplete) {
                     AlwaysLog("[%04x:%04x]: Firmware upgrade completed successfully.\n", mVendorId, mProductId);
                 } else {
@@ -347,8 +537,12 @@ void BrcmPatchRAM::uploadFirmware()
             } else {
                 AlwaysLog("[%04x:%04x]: Firmware upgrade failed.\n", mVendorId, mProductId);
             }
+        } else {
+            AlwaysLog("[%04x:%04x]: Interrupt/bulk pipes not available.\n", mVendorId, mProductId);
         }
         mInterface.close(this);
+    } else {
+        AlwaysLog("[%04x:%04x]: Could not configure device or open its interface.\n", mVendorId, mProductId);
     }
     
     // cleanup
@@ -362,6 +556,8 @@ void BrcmPatchRAM::uploadFirmware()
     }
     mInterface.setInterface(NULL);
     mDevice.close(this);
+
+    return ok;
 }
 
 BrcmFirmwareStore* BrcmPatchRAM::getFirmwareStore()
@@ -563,7 +759,8 @@ void BrcmPatchRAM::readCompletion(void* target, void* parameter, IOReturn status
             me->mDeviceState = kUpdateAborted;
             break;
     }
-    
+
+    me->mReadDone = true;
     IOLockUnlock(me->mCompletionLock);
     
     // wake waiting task in performUpgrade (in IOLockSleep)...
@@ -597,8 +794,9 @@ IOReturn BrcmPatchRAM::hciParseResponse(void* response, UInt16 length, void* out
                     
                     mFirmwareVersion = *(UInt16*)(((char*)response) + 10);
                     
-                    DebugLog("[%04x:%04x]: Firmware version: v%d.\n",
-                             mVendorId, mProductId, mFirmwareVersion + 0x1000);
+                    AlwaysLog("[%04x:%04x]: Firmware version: v%d (%s).\n",
+                              mVendorId, mProductId, mFirmwareVersion + 0x1000,
+                              mFirmwareVersion > 0 ? "already loaded" : "not loaded");
                     
                     // Device does not require a firmware patch at this time
                     if (mFirmwareVersion > 0)
@@ -883,12 +1081,40 @@ bool BrcmPatchRAM::performUpgrade()
         }
         
         // queue async read
+        mReadDone = false;
         if (!continuousRead()) {
             mDeviceState = kUpdateAborted;
             continue;
         }
-        // wait for completion of the async read
-        IOLockSleep(mCompletionLock, this, 0);
+
+        // wait for completion of the async read, but not forever
+        uint64_t deadline;
+        clock_interval_to_deadline(mStepTimeout, kMillisecondScale, &deadline);
+        while (!mReadDone) {
+            if (IOLockSleepDeadline(mCompletionLock, this, deadline, THREAD_UNINT) == THREAD_TIMED_OUT && !mReadDone)
+                break;
+        }
+
+        if (!mReadDone) {
+            AlwaysLog("[%04x:%04x]: No reply from device within %u ms (state %d), aborting attempt.\n",
+                      mVendorId, mProductId, mStepTimeout, (int)mDeviceState);
+            mDeviceState = kUpdateAborted;
+
+            // Abort the stuck read. The completion handler takes the lock, so drop it meanwhile.
+            IOLockUnlock(mCompletionLock);
+            mInterruptPipe.abort();
+            IOLockLock(mCompletionLock);
+
+            // Let the (aborted) completion run before anything is torn down.
+            clock_interval_to_deadline(2000, kMillisecondScale, &deadline);
+            while (!mReadDone) {
+                if (IOLockSleepDeadline(mCompletionLock, this, deadline, THREAD_UNINT) == THREAD_TIMED_OUT && !mReadDone) {
+                    AlwaysLog("[%04x:%04x]: Pending read did not complete after abort.\n", mVendorId, mProductId);
+                    break;
+                }
+            }
+            mDeviceState = kUpdateAborted;
+        }
     }
     
     IOLockUnlock(mCompletionLock);
