@@ -59,6 +59,8 @@ static const UInt32 kRecoveryBackoffMs[] = { 5000, 15000, 45000 };
 // Upper bound for consecutive forced USB re-enumerations without a healthy device / successful upload.
 #define kMaxPortResets 3
 static UInt32 sPortResets = 0;
+static uint64_t sLastResetMs = 0;  // uptime of the last requested reset; old resets stop counting after kResetForgetMs
+static const uint64_t kResetForgetMs = 10 * 60 * 1000;
 
 // Wake check: wait this long after a power-on notification before probing the device (ms).
 #define kWakeCheckDelayMs 2500
@@ -616,6 +618,11 @@ void BrcmPatchRAM::requestReset(const char* reason)
     if (mShuttingDown || mResetIssued || !device || device->isInactive())
         return;
 
+    // A successful upload does not clear the counter (a reset loop uploads fine every time).
+    // Only a passing wake probe or enough time since the last reset does.
+    if (sPortResets && uptimeMs() - sLastResetMs > kResetForgetMs)
+        sPortResets = 0;
+
     if (sPortResets >= kMaxPortResets) {
         AlwaysLog("[%04x:%04x]: Not resetting the USB port (%s): %u resets in a row without success.\n",
                   mVendorId, mProductId, reason, sPortResets);
@@ -624,6 +631,7 @@ void BrcmPatchRAM::requestReset(const char* reason)
     }
 
     sPortResets++;
+    sLastResetMs = uptimeMs();
     mResetIssued = true;
     AlwaysLog("[%04x:%04x]: Resetting the USB port (%s), %u/%u.\n", mVendorId, mProductId, reason, sPortResets, kMaxPortResets);
     publishStatus("BPR-LastAction", "reset requested (%s) at uptime %llu ms", reason, uptimeMs());
@@ -693,7 +701,6 @@ bool BrcmPatchRAM::uploadWithRetries()
         if (uploadFirmwareOnce()) {
             if (attempt > 1)
                 AlwaysLog("[%04x:%04x]: Upload succeeded on attempt %u/%u.\n", mVendorId, mProductId, attempt, mMaxAttempts);
-            sPortResets = 0;
             publishStatus("BPR-LastUpload", "ok, attempt %u/%u, firmware v%d, uptime %llu ms",
                           (unsigned)attempt, (unsigned)mMaxAttempts, (int)mFirmwareVersion + 0x1000, uptimeMs());
             // Now that the chip is ready, let the native Bluetooth stack take over.
