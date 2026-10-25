@@ -1,5 +1,11 @@
 BrcmPatchRAM Changelog
 ======================
+#### Unreleased
+- BrcmPatchRAM3: bounded waits for device replies, several upload attempts and background recovery after a failed upload
+- BrcmPatchRAM3: keep USB interfaces unregistered during the firmware upload so `bluetoothd` cannot interfere (`bpr_hide`)
+- BrcmPatchRAM3: check the device after wake and re-enumerate it if it is dead (`bpr_wakeprobe`)
+- BrcmPatchRAM3: publish state as `BPR-*` IORegistry properties
+
 #### v2.7.2
 - Added `bluetoothd` patches for macOS 26 (thx @spotlightishere et al)
 

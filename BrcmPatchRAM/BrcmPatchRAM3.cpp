@@ -41,6 +41,7 @@
 #define kReadBufferSize 0x200
 
 #include <kern/clock.h>
+#include <stdarg.h>
 
 #ifndef THREAD_UNINT
 #define THREAD_UNINT 0
@@ -55,9 +56,18 @@
 // Background recovery: delays (ms) before each retry round after a failed upload.
 static const UInt32 kRecoveryBackoffMs[] = { 5000, 15000, 45000 };
 #define kMaxRecoveryRounds (sizeof(kRecoveryBackoffMs) / sizeof(kRecoveryBackoffMs[0]))
-// Upper bound for consecutive forced USB re-enumerations without a successful upload.
+// Upper bound for consecutive forced USB re-enumerations without a healthy device / successful upload.
 #define kMaxPortResets 3
 static UInt32 sPortResets = 0;
+
+// Wake check: wait this long after a power-on notification before probing the device (ms).
+#define kWakeCheckDelayMs 2500
+// Pause between the two probes that must both fail before the port is reset (ms).
+#define kWakeProbeGapMs 1000
+// How often the wake check is postponed because the device is busy before it gives up.
+#define kMaxWakeCheckRetries 5
+// Settle time between finishing the upload and letting the native Bluetooth stack see the interfaces (ms).
+#define kRevealSettleMs 250
 
 static uint64_t uptimeMs()
 {
@@ -157,6 +167,21 @@ bool BrcmPatchRAM::init(OSDictionary *properties)
         mAllowPortReset = false;
         if (PE_parse_boot_argn("bpr_portreset", &delay, sizeof delay))
             mAllowPortReset = delay != 0;
+
+        // Keep the USB interfaces unregistered (invisible to bluetoothd) while firmware is uploaded.
+        mHideInterfaces = true;
+        if (PE_parse_boot_argn("bpr_hide", &delay, sizeof delay))
+            mHideInterfaces = delay != 0;
+
+        // Check that the device still answers after wake and re-enumerate it if not.
+        mWakeProbe = true;
+        if (PE_parse_boot_argn("bpr_wakeprobe", &delay, sizeof delay))
+            mWakeProbe = delay != 0;
+
+        // Testing only: make the wake probe always fail so the recovery path gets exercised.
+        mTestProbeFail = false;
+        if (PE_parse_boot_argn("bpr_testprobefail", &delay, sizeof delay))
+            mTestProbeFail = delay != 0;
     }
     return result;
 }
@@ -291,9 +316,21 @@ bool BrcmPatchRAM::start(IOService *provider)
         if (!mRecoveryTimer || mRecoveryLoop->addEventSource(mRecoveryTimer) != kIOReturnSuccess) {
             AlwaysLog("[%04x:%04x]: Unable to set up recovery timer, background recovery disabled.\n", mVendorId, mProductId);
             OSSafeReleaseNULL(mRecoveryTimer);
-            OSSafeReleaseNULL(mRecoveryLoop);
         }
+
+        mWakeTimer = IOTimerEventSource::timerEventSource(this,
+            OSMemberFunctionCast(IOTimerEventSource::Action, this, &BrcmPatchRAM::wakeCheckFired));
+        if (!mWakeTimer || mRecoveryLoop->addEventSource(mWakeTimer) != kIOReturnSuccess) {
+            AlwaysLog("[%04x:%04x]: Unable to set up wake check timer, wake check disabled.\n", mVendorId, mProductId);
+            OSSafeReleaseNULL(mWakeTimer);
+        }
+
+        if (!mRecoveryTimer && !mWakeTimer)
+            OSSafeReleaseNULL(mRecoveryLoop);
     }
+
+    publishStatus("BPR-Config", "attempts=%u steptimeout=%u hide=%d wakeprobe=%d portreset=%d testprobefail=%d",
+                  (unsigned)mMaxAttempts, (unsigned)mStepTimeout, mHideInterfaces, mWakeProbe, mAllowPortReset, mTestProbeFail);
 
     IOLockLock(mUploadLock);
     mUploadOk = uploadWithRetries();
@@ -306,6 +343,10 @@ bool BrcmPatchRAM::start(IOService *provider)
             AlwaysLog("[%04x:%04x]: Firmware upload failed, will retry in background in %u ms.\n",
                       mVendorId, mProductId, kRecoveryBackoffMs[0]);
             scheduleRecovery(kRecoveryBackoffMs[0]);
+
+            // Without a recovery timer nobody would ever reveal the interfaces again.
+            if (!mRecoveryTimer)
+                revealInterfaces();
         }
     }
 
@@ -365,7 +406,16 @@ void BrcmPatchRAM::stop(IOService* provider)
             mRecoveryLoop->removeEventSource(mRecoveryTimer);
         OSSafeReleaseNULL(mRecoveryTimer);
     }
+    if (mWakeTimer) {
+        mWakeTimer->cancelTimeout();
+        if (mRecoveryLoop)
+            mRecoveryLoop->removeEventSource(mWakeTimer);
+        OSSafeReleaseNULL(mWakeTimer);
+    }
     OSSafeReleaseNULL(mRecoveryLoop);
+
+    // Never leave the Bluetooth interfaces hidden when going away.
+    revealInterfaces();
 
     OSSafeReleaseNULL(mFirmwareStore);
 
@@ -404,18 +454,172 @@ IOReturn BrcmPatchRAM::setPowerState(unsigned long which, IOService *whom)
               uptimeMs(),
               mUploadOk ? "ok" : "not ok");
 
+    publishStatus("BPR-LastPower", "%s at uptime %llu ms", which == kMyOnPowerState ? "ON" : "OFF", uptimeMs());
+
     if (which == kMyOnPowerState) {
         /*
-         * Never touch the device here, this runs on the power management thread
-         * and a working controller must not be disturbed. Only if the last upload
-         * failed, schedule a (fresh) background recovery.
+         * Never touch the device here, this runs on the power management thread.
+         * Only schedule work on our own work loop:
+         *  - upload failed earlier: start a fresh round of background recovery
+         *  - upload was fine: check a bit later that the device still answers
+         *    (it is not re-enumerated on every wake, and sometimes it is dead
+         *    after resume without the USB stack noticing)
          */
-        if (!mUploadOk && !mResetIssued && !mShuttingDown) {
-            mRecoveryRound = 0;
-            scheduleRecovery(3000);
+        if (!mResetIssued && !mShuttingDown) {
+            if (!mUploadOk) {
+                mRecoveryRound = 0;
+                scheduleRecovery(3000);
+            } else if (mWakeProbe && mWakeTimer) {
+                mWakeCheckRetries = 0;
+                mWakeTimer->setTimeoutMS(kWakeCheckDelayMs);
+            }
         }
     }
     return IOPMAckImplied;
+}
+
+void BrcmPatchRAM::publishStatus(const char* key, const char* format, ...)
+{
+    // Readable without root: ioreg -l -w0 | grep BPR-
+    char buffer[160];
+    va_list args;
+
+    va_start(args, format);
+    vsnprintf(buffer, sizeof(buffer), format, args);
+    va_end(args);
+
+    setProperty(key, buffer);
+}
+
+/*
+ * Register the interfaces that were created hidden (see setConfiguration), so that
+ * the native Bluetooth stack can see the device. Must happen on every exit path
+ * of an upload, otherwise Bluetooth would never come up.
+ */
+void BrcmPatchRAM::revealInterfaces()
+{
+    if (!mInterfacesHidden)
+        return;
+
+    mInterfacesHidden = false;
+
+    if (mDevice.getValidatedDevice()) {
+        IOSleep(kRevealSettleMs);
+        mDevice.registerInterfaces();
+        publishStatus("BPR-LastReveal", "interfaces registered at uptime %llu ms", uptimeMs());
+        AlwaysLog("[%04x:%04x]: Interfaces registered for matching.\n", mVendorId, mProductId);
+    }
+}
+
+/*
+ * Passive health check: a standard USB GET_STATUS on the default control endpoint.
+ * It does not touch the Bluetooth (HCI) state, so it is safe while Apple's stack
+ * is using the controller. Returns false only if the device is clearly dead;
+ * anything inconclusive counts as alive.
+ */
+bool BrcmPatchRAM::probeDeviceAlive()
+{
+    if (mTestProbeFail) {
+        AlwaysLog("[%04x:%04x]: Wake probe: simulated failure (bpr_testprobefail).\n", mVendorId, mProductId);
+        return false;
+    }
+
+    IOService* device = mDevice.getValidatedDevice();
+
+    // A device that is already being torn down (normal re-enumeration after wake) is not "dead".
+    if (!device || device->isInactive())
+        return true;
+
+    if (!mDevice.open(this)) {
+        publishStatus("BPR-LastProbe", "inconclusive (could not open device) at uptime %llu ms", uptimeMs());
+        return true;
+    }
+
+    USBStatus status = 0;
+    IOReturn result = mDevice.getDeviceStatus(this, &status);
+    mDevice.close(this);
+
+    switch (result) {
+        case kIOReturnSuccess:
+        // the device is going away or someone else is using it: nothing we can conclude
+        case kIOReturnNoDevice:
+        case kIOReturnNotAttached:
+        case kIOReturnOffline:
+        case kIOReturnAborted:
+        case kIOReturnBusy:
+        case kIOReturnExclusiveAccess:
+        case kIOReturnNotPermitted:
+            return true;
+
+        default:
+            // e.g. kIOReturnNotResponding / timeouts / transaction errors: the chip is not answering
+            AlwaysLog("[%04x:%04x]: Wake probe: GET_STATUS failed (\"%s\" 0x%08x).\n", mVendorId, mProductId, stringFromReturn(result), result);
+            return false;
+    }
+}
+
+void BrcmPatchRAM::wakeCheckFired(IOTimerEventSource*)
+{
+    if (mShuttingDown || mResetIssued || !mUploadOk || !mWakeProbe || !mUploadLock)
+        return;
+
+    // an upload / recovery round is running, check again shortly
+    if (!IOLockTryLock(mUploadLock)) {
+        if (mWakeCheckRetries++ < kMaxWakeCheckRetries && mWakeTimer)
+            mWakeTimer->setTimeoutMS(1000);
+        return;
+    }
+
+    bool alive = probeDeviceAlive();
+
+    if (!alive) {
+        IOSleep(kWakeProbeGapMs);
+        alive = probeDeviceAlive();
+    }
+    IOLockUnlock(mUploadLock);
+
+    if (alive) {
+        sPortResets = 0;
+        publishStatus("BPR-LastProbe", "alive at uptime %llu ms", uptimeMs());
+        DebugLog("wake probe ok\n");
+        return;
+    }
+
+    publishStatus("BPR-LastProbe", "DEAD at uptime %llu ms", uptimeMs());
+    AlwaysLog("[%04x:%04x]: Device does not answer after wake.\n", mVendorId, mProductId);
+    requestReset("device dead after wake");
+}
+
+/*
+ * Ask the USB stack to reset the port and re-enumerate the device. The driver is
+ * restarted from scratch afterwards (including the firmware upload). Runs in a
+ * separate thread, see USBDeviceShim::reEnumerateAsync.
+ */
+void BrcmPatchRAM::requestReset(const char* reason)
+{
+    IOService* device = mDevice.getValidatedDevice();
+
+    // Never reset on behalf of a device object that is already gone: the port may hold a new device by now.
+    if (mShuttingDown || mResetIssued || !device || device->isInactive())
+        return;
+
+    if (sPortResets >= kMaxPortResets) {
+        AlwaysLog("[%04x:%04x]: Not resetting the USB port (%s): %u resets in a row without success.\n",
+                  mVendorId, mProductId, reason, sPortResets);
+        publishStatus("BPR-LastAction", "reset refused (%s), limit reached, uptime %llu ms", reason, uptimeMs());
+        return;
+    }
+
+    sPortResets++;
+    mResetIssued = true;
+    AlwaysLog("[%04x:%04x]: Resetting the USB port (%s), %u/%u.\n", mVendorId, mProductId, reason, sPortResets, kMaxPortResets);
+    publishStatus("BPR-LastAction", "reset requested (%s) at uptime %llu ms", reason, uptimeMs());
+
+    IOReturn result = mDevice.reEnumerateAsync();
+    if (result != kIOReturnSuccess) {
+        mResetIssued = false;
+        AlwaysLog("[%04x:%04x]: Could not start USB re-enumeration (0x%08x).\n", mVendorId, mProductId, result);
+    }
 }
 
 void BrcmPatchRAM::scheduleRecovery(UInt32 delayMs)
@@ -458,6 +662,9 @@ void BrcmPatchRAM::recoveryTimerFired(IOTimerEventSource*)
             scheduleRecovery(next);
         } else {
             AlwaysLog("[%04x:%04x]: Background recovery gave up; will try again on next wake.\n", mVendorId, mProductId);
+            publishStatus("BPR-LastUpload", "recovery gave up at uptime %llu ms", uptimeMs());
+            // Fail open: let the native stack see the device, it may still work (or at least report an error).
+            revealInterfaces();
         }
     }
 }
@@ -474,6 +681,10 @@ bool BrcmPatchRAM::uploadWithRetries()
             if (attempt > 1)
                 AlwaysLog("[%04x:%04x]: Upload succeeded on attempt %u/%u.\n", mVendorId, mProductId, attempt, mMaxAttempts);
             sPortResets = 0;
+            publishStatus("BPR-LastUpload", "ok, attempt %u/%u, firmware v%d, uptime %llu ms",
+                          (unsigned)attempt, (unsigned)mMaxAttempts, (int)mFirmwareVersion + 0x1000, uptimeMs());
+            // Now that the chip is ready, let the native Bluetooth stack take over.
+            revealInterfaces();
             return true;
         }
 
@@ -484,17 +695,11 @@ bool BrcmPatchRAM::uploadWithRetries()
             IOSleep(500 * attempt + mPostResetDelay);
     }
 
-    if (mAllowPortReset && !mShuttingDown && sPortResets < kMaxPortResets && mDevice.getValidatedDevice()) {
-        sPortResets++;
-        AlwaysLog("[%04x:%04x]: All attempts failed, forcing USB re-enumeration (%u/%u).\n",
-                  mVendorId, mProductId, sPortResets, kMaxPortResets);
-        mResetIssued = true;
-        IOReturn result = mDevice.reEnumerate();
-        if (result != kIOReturnSuccess) {
-            mResetIssued = false;
-            AlwaysLog("[%04x:%04x]: USB re-enumeration failed (\"%s\" 0x%08x).\n", mVendorId, mProductId, stringFromReturn(result), result);
-        }
-    }
+    publishStatus("BPR-LastUpload", "FAILED after %u attempts, uptime %llu ms", (unsigned)mMaxAttempts, uptimeMs());
+
+    // Last resort. The reset runs in its own thread, so it is safe to request it from here.
+    if (mAllowPortReset && !mShuttingDown)
+        requestReset("all upload attempts failed");
     return false;
 }
 
@@ -543,8 +748,24 @@ bool BrcmPatchRAM::uploadFirmwareOnce()
         mInterface.close(this);
     } else {
         AlwaysLog("[%04x:%04x]: Could not configure device or open its interface.\n", mVendorId, mProductId);
+
+        /*
+         * If this happened while the interfaces are hidden, hiding may not work on this
+         * system. Fall back to the classic behaviour (interfaces visible during the
+         * upload) for all further attempts.
+         */
+        if (mInterfacesHidden) {
+            AlwaysLog("[%04x:%04x]: Hidden interfaces are not usable, falling back to visible interfaces.\n", mVendorId, mProductId);
+            publishStatus("BPR-Hide", "unusable, fell back to visible interfaces at uptime %llu ms", uptimeMs());
+            mHideInterfaces = false;
+            mInterface.setInterface(NULL);
+            mDevice.close(this);
+            revealInterfaces();
+            if (!mDevice.open(this))
+                return false;
+        }
     }
-    
+
     // cleanup
     if (mInterruptPipe.getValidatedPipe()) {
         mInterruptPipe.abort();
@@ -653,11 +874,21 @@ bool BrcmPatchRAM::setConfiguration(int configurationIndex)
         return true;
     }
     
-    // Set the configuration to the first configuration
-    if ((result = mDevice.setConfiguration(this, configurationDescriptor->bConfigurationValue, true)) != kIOReturnSuccess) {
+    /*
+     * Set the configuration to the first configuration.
+     *
+     * With interface matching disabled the interfaces are created but not registered,
+     * so the native Bluetooth stack (bluetoothd) cannot see the controller while the
+     * firmware is being uploaded. Otherwise it starts talking to the chip in the middle
+     * of the upload when it is already running, e.g. after wake. They are registered
+     * by revealInterfaces() once the upload is done.
+     */
+    if ((result = mDevice.setConfiguration(this, configurationDescriptor->bConfigurationValue, !mHideInterfaces)) != kIOReturnSuccess) {
         AlwaysLog("[%04x:%04x]: Unable to (re-)configure device (\"%s\" 0x%08x).\n", mVendorId, mProductId, stringFromReturn(result), result);
         return false;
     }
+    if (mHideInterfaces)
+        mInterfacesHidden = true;
     
     DebugLog("[%04x:%04x]: Set device configuration to configuration index %d successfully.\n",
              mVendorId, mProductId, configurationIndex);

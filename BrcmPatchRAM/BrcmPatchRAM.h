@@ -123,20 +123,31 @@ private:
      */
     UInt32 mMaxAttempts = 3;
     UInt32 mStepTimeout = 3000;          // ms to wait for one device reply
-    bool mAllowPortReset = false;        // boot-arg bpr_portreset=1
+    bool mAllowPortReset = false;        // boot-arg bpr_portreset=1 (reset USB port if all upload attempts fail)
+    bool mHideInterfaces = true;         // boot-arg bpr_hide=0 disables: keep interfaces unregistered during upload
+    bool mWakeProbe = true;              // boot-arg bpr_wakeprobe=0 disables: check device health after wake
+    bool mTestProbeFail = false;         // boot-arg bpr_testprobefail=1: pretend the wake probe failed (testing)
     volatile bool mReadDone = false;     // set by readCompletion, protected by mCompletionLock
     volatile bool mUploadOk = false;     // result of the most recent upload run
     volatile bool mShuttingDown = false;
     volatile bool mResetIssued = false;  // USB re-enumeration requested; device will go away
+    volatile bool mInterfacesHidden = false; // interfaces exist but are not registered for matching yet
     UInt32 mRecoveryRound = 0;
+    UInt32 mWakeCheckRetries = 0;
     IOWorkLoop* mRecoveryLoop = NULL;
     IOTimerEventSource* mRecoveryTimer = NULL;
-    IOLock* mUploadLock = NULL;          // serialises start()/recovery uploads
+    IOTimerEventSource* mWakeTimer = NULL;
+    IOLock* mUploadLock = NULL;          // serialises start()/recovery/wake-check device access
 
     bool uploadFirmwareOnce();
     bool uploadWithRetries();
     void scheduleRecovery(UInt32 delayMs);
     void recoveryTimerFired(IOTimerEventSource* sender);
+    void wakeCheckFired(IOTimerEventSource* sender);
+    bool probeDeviceAlive();
+    void requestReset(const char* reason);
+    void revealInterfaces();
+    void publishStatus(const char* key, const char* format, ...) __printflike(3, 4);
 #endif
 
 #ifdef DEBUG

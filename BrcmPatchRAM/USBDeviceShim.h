@@ -64,6 +64,8 @@ public:
     IOReturn getDeviceStatus(IOService* forClient, USBStatus *status);
     IOReturn resetDevice();
     IOReturn reEnumerate();  // USB port reset; device is terminated and re-created (host stack only)
+    IOReturn reEnumerateAsync();  // same, but from a separate thread so the caller never blocks termination
+    void registerInterfaces();  // register interfaces created with startInterfaceMatching=false for matching
     UInt8 getNumConfigurations();
     const USBCONFIGURATIONDESCRIPTOR* getFullConfigurationDescriptor(UInt8 configIndex);
     IOReturn getConfiguration(IOService* forClient, UInt8 *configNumber);

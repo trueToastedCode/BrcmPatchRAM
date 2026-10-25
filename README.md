@@ -257,6 +257,14 @@ There are a number of delays which can be changed with the following kernel boot
 - `bpr_preresetdelay`: Changes `mPreResetDelay`, the delay in ms assumed to be needed for the device to accept the firmware. The value is unused when `bpr_handshake` is `1` (passed manually or applied automatically based on the device identifier). Default value is `250`.
 - `bpr_postresetdelay`: Changes `mPostResetDelay`, the delay in ms assumed to be needed for the firmware to initialise after reseting the device upon firmware upload. Default value is `100`.
 - `bpr_probedelay`: Changes `mProbeDelay` (removed in BrcmPatchRAM3), the delay in ms before probing the device. Default value is `0`.
+- `bpr_attempts` (BrcmPatchRAM3 only): Number of firmware upload attempts per start (1-10). Default value is `3`.
+- `bpr_steptimeout` (BrcmPatchRAM3 only): Time in ms to wait for a single reply of the device before the attempt is aborted (500-60000). Default value is `3000`.
+- `bpr_hide` (BrcmPatchRAM3 only): `1` keeps the USB interfaces unregistered, so that `bluetoothd` cannot talk to the chip while firmware is being uploaded, and registers them afterwards. `0` restores the old behaviour. Default value is `1`.
+- `bpr_wakeprobe` (BrcmPatchRAM3 only): `1` sends a harmless USB `GET_STATUS` to the device a few seconds after every wake and resets the USB port (re-enumerating the device and reloading the firmware) if it does not answer. This drops a Bluetooth session that is working only in the sense that the chip is already dead. Default value is `1`.
+- `bpr_portreset` (BrcmPatchRAM3 only): `1` also resets the USB port if every firmware upload attempt failed. Default value is `0`.
+- `bpr_testprobefail` (BrcmPatchRAM3 only, testing): `1` makes the wake probe always report a dead device, to exercise the recovery path after the next wake. Default value is `0`.
+
+BrcmPatchRAM3 publishes its state as properties on its IORegistry entry, readable without root: `ioreg -l -w0 | grep BPR-` (`BPR-Config`, `BPR-LastUpload`, `BPR-LastPower`, `BPR-LastProbe`, `BPR-LastAction`, `BPR-LastReveal`).
 
 For example, to change `mPostResetDelay` to 400 ms, use the kernel boot argument: `bpr_postresetdelay=400`.
 
