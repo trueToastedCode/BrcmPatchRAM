@@ -200,6 +200,9 @@ bool BrcmPatchRAM::init(OSDictionary *properties)
         mVerifyTimeout = 6000;
         if (PE_parse_boot_argn("bpr_verifytimeout", &delay, sizeof delay))
             mVerifyTimeout = delay < 1000 ? 1000 : (delay > 30000 ? 30000 : delay);
+        mVerifyQuiet = kVerifyQuietMs;
+        if (PE_parse_boot_argn("bpr_verifyquiet", &delay, sizeof delay))
+            mVerifyQuiet = delay > 2000 ? 2000 : delay;   // 0 = no drain phase, no read left to abort
     }
     return result;
 }
@@ -347,9 +350,9 @@ bool BrcmPatchRAM::start(IOService *provider)
             OSSafeReleaseNULL(mRecoveryLoop);
     }
 
-    publishStatus("BPR-Config", "attempts=%u steptimeout=%u hide=%d wakeprobe=%d portreset=%d testprobefail=%d verify=%d verifytimeout=%u",
+    publishStatus("BPR-Config", "attempts=%u steptimeout=%u hide=%d wakeprobe=%d portreset=%d testprobefail=%d verify=%d verifytimeout=%u verifyquiet=%u",
                   (unsigned)mMaxAttempts, (unsigned)mStepTimeout, mHideInterfaces, mWakeProbe, mAllowPortReset, mTestProbeFail,
-                  mVerifyHCI, (unsigned)mVerifyTimeout);
+                  mVerifyHCI, (unsigned)mVerifyTimeout, (unsigned)mVerifyQuiet);
 
     IOLockLock(mUploadLock);
     mUploadOk = uploadWithRetries();
@@ -844,7 +847,9 @@ bool BrcmPatchRAM::verifyControllerReady()
         }
     }
 
-    if (mVerifyGotVersion && mVerifyReadStatus == kIOReturnSuccess) {
+    if (mVerifyGotVersion && mVerifyReadStatus == kIOReturnSuccess && mVerifyQuiet == 0) {
+        ok = true;      // reply seen, nothing queued: leave the pipe exactly as the upload left it
+    } else if (mVerifyGotVersion && mVerifyReadStatus == kIOReturnSuccess) {
         // The chip answers. Wait until it has also stopped talking, any late event is eaten here.
         while (!mShuttingDown) {
             if (!pending) {
@@ -852,7 +857,7 @@ bool BrcmPatchRAM::verifyControllerReady()
                 if (!(pending = continuousRead()))
                     break;
             }
-            if (!waitForFlag(mCompletionLock, &mReadDone, this, kVerifyQuietMs))
+            if (!waitForFlag(mCompletionLock, &mReadDone, this, mVerifyQuiet))
                 break;                      // quiet: settled (the read is still queued, aborted below)
 
             pending = false;
