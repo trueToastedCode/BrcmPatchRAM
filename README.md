@@ -263,6 +263,8 @@ There are a number of delays which can be changed with the following kernel boot
 - `bpr_wakeprobe` (BrcmPatchRAM3 only): `1` sends a harmless USB `GET_STATUS` to the device about 2.5 seconds after a wake. If the device does not answer twice in a row (1 second apart), the USB port is reset, which re-enumerates the device and reloads the firmware. This only applies when the device survives the sleep; if it is re-enumerated by the system anyway, the driver simply starts again and uploads the firmware. At most 3 such resets are done in a row; a passing probe, or 10 minutes without a reset, clears the count. Default value is `1`.
 - `bpr_portreset` (BrcmPatchRAM3 only): `1` also resets the USB port if every firmware upload attempt failed. Default value is `0`.
 - `bpr_testprobefail` (BrcmPatchRAM3 only, testing): `1` makes the wake probe always report a dead device and runs it about 8 seconds after every driver start (self test of the probe and USB reset path). Expect up to 3 Bluetooth restarts in a row, then the driver gives up and leaves Bluetooth running; check `BPR-LastProbe` and `BPR-LastAction`. Default value is `0`.
+- `bpr_verify` (BrcmPatchRAM3 only): `1` makes the driver check the controller itself after every firmware upload, while the USB interfaces are still hidden from `bluetoothd`. It sends HCI `Read Local Version` (repeated every 750 ms while the chip is silent), discards every other event the chip emits (for example an unsolicited Reset completion after it rebooted into the new firmware) and requires 250 ms of silence afterwards. Only then the interfaces are handed to the Bluetooth stack. If the chip never answers, the attempt counts as failed and, once all attempts are used, the USB port is reset (up to 3 times in a row, even without `bpr_portreset`). `0` restores the old behaviour. Default value is `1`.
+- `bpr_verifytimeout` (BrcmPatchRAM3 only): Total time in ms the controller gets to answer during `bpr_verify` (1000-30000). Default value is `6000`.
 
 BrcmPatchRAM3 publishes its state as properties on its IORegistry entry, readable without root: `ioreg -l -w0 | grep BPR-`. This is the way to see what the driver did, since its kernel log lines do not show up in the unified log.
 
@@ -270,6 +272,7 @@ BrcmPatchRAM3 publishes its state as properties on its IORegistry entry, readabl
 | --- | --- |
 | `BPR-Config` | Effective settings of this boot |
 | `BPR-LastUpload` | Result of the last firmware upload (attempt, uptime) |
+| `BPR-LastVerify` | Result of the controller check after the upload (`ok` with tries, stray events and the chip's HCI/LMP version, or `FAILED`) |
 | `BPR-LastReveal` | When the USB interfaces were handed to the Bluetooth stack |
 | `BPR-LastPower` | Last power state change seen by the driver (ON/OFF, uptime) |
 | `BPR-LastProbe` | Result of the last wake probe (`alive`, `DEAD`, `inconclusive`); only present after a probe ran |
@@ -328,9 +331,10 @@ If the firmware upload failed with an error, try installing the debug version of
 
 #### Bluetooth breaks after sleep (BrcmPatchRAM3)
 
-Many Broadcom USB controllers lose power during sleep and are enumerated again on wake, so the firmware has to be uploaded again every time. Two things can go wrong:
+Many Broadcom USB controllers lose power during sleep and are enumerated again on wake, so the firmware has to be uploaded again every time. Three things can go wrong:
 
  * `bluetoothd` is already running and talks to the chip while the firmware is being uploaded. `bpr_hide` (on by default) prevents this by keeping the USB interfaces hidden until the upload is done.
+ * The firmware upload succeeded, but the chip can still be busy with the new firmware when `bluetoothd` starts talking to it. Its first commands may then be lost, the stack logs `Command Complete, orphan event` and then `HCI initialization failed` and restarts in a loop (`log show --predicate 'process == "bluetoothd"'`). `bpr_verify` (on by default) waits until the chip answers and is quiet before the interfaces are revealed; `BPR-LastVerify` shows how long that took.
  * The chip is not re-enumerated but does not answer after the wake. `bpr_wakeprobe` (on by default) detects this and resets the USB port.
 
 If Bluetooth is broken, run `ioreg -l -w0 | grep BPR-` **before** restarting and include the output in an issue. `BPR-LastUpload` tells whether the upload worked, `BPR-LastProbe` and `BPR-LastAction` tell whether the wake probe found a dead device and what was done about it.

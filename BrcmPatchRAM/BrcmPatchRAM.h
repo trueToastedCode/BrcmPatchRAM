@@ -139,6 +139,35 @@ private:
     IOTimerEventSource* mWakeTimer = NULL;
     IOLock* mUploadLock = NULL;          // serialises start()/recovery/wake-check device access
 
+    /*
+     * Controller verification before the interfaces are handed to the native stack.
+     * After the firmware upload the chip may still be rebooting its new firmware and can emit
+     * its own HCI Reset completion. If bluetoothd starts its HCI init in the middle of that, its
+     * first commands are lost, the stack sees an orphan event and times out on ReadLocalVersion
+     * ("HCI initialization failed", crash loop). So, while the interfaces are still hidden,
+     * ask the chip for its local version ourselves, discard any stray events and only continue
+     * once it answers.
+     */
+    bool mVerifyHCI = true;              // boot-arg bpr_verify=0 disables
+    UInt32 mVerifyTimeout = 6000;        // boot-arg bpr_verifytimeout: total ms to wait for the controller to answer
+    volatile bool mVerifyMode = false;   // readCompletion routes events to verifyParse (protected by mCompletionLock)
+    volatile bool mVerifyGotVersion = false; // a Command Complete for Read Local Version arrived
+    volatile bool mVerifyFailedLast = false; // the most recent upload attempt failed in verification, not in the upload
+    volatile IOReturn mVerifyReadStatus = kIOReturnSuccess; // last non-success status of a read in verify mode
+    volatile UInt32 mVerifyStray = 0;    // events other than the Read Local Version reply (discarded)
+    volatile UInt16 mVerifyLastStrayOpcode = 0;
+    volatile UInt8 mVerifyLastStrayEvent = 0;
+    UInt8 mVerifyOpStatus = 0;           // HCI status of the Read Local Version reply
+    UInt8 mVerifyHciVersion = 0;
+    UInt16 mVerifyHciRevision = 0;
+    UInt8 mVerifyLmpVersion = 0;
+    UInt16 mVerifyManufacturer = 0;
+    UInt16 mVerifyLmpSubversion = 0;
+
+    bool verifyControllerReady();
+    void verifyParse(void* response, UInt16 length);
+    void abortPendingRead();
+
     bool uploadFirmwareOnce();
     bool uploadWithRetries();
     void scheduleRecovery(UInt32 delayMs);

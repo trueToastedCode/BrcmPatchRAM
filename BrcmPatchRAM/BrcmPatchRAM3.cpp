@@ -70,6 +70,12 @@ static const uint64_t kResetForgetMs = 10 * 60 * 1000;
 #define kMaxWakeCheckRetries 5
 // Settle time between finishing the upload and letting the native Bluetooth stack see the interfaces (ms).
 #define kRevealSettleMs 250
+// Controller verification: how long to wait for one Read Local Version reply before sending the command again (ms).
+#define kVerifyTryMs 750
+// After the controller answered: how long it has to stay silent before it counts as settled (ms), and the
+// maximum number of late events that are drained before giving up waiting for silence.
+#define kVerifyQuietMs 250
+#define kVerifyMaxDrain 8
 
 static uint64_t uptimeMs()
 {
@@ -184,6 +190,16 @@ bool BrcmPatchRAM::init(OSDictionary *properties)
         mTestProbeFail = false;
         if (PE_parse_boot_argn("bpr_testprobefail", &delay, sizeof delay))
             mTestProbeFail = delay != 0;
+
+        // Ask the controller for its version (and discard stray events) before the native stack may see it.
+        mVerifyHCI = true;
+        if (PE_parse_boot_argn("bpr_verify", &delay, sizeof delay))
+            mVerifyHCI = delay != 0;
+
+        // Total time in ms the controller gets to answer that request (1000..30000).
+        mVerifyTimeout = 6000;
+        if (PE_parse_boot_argn("bpr_verifytimeout", &delay, sizeof delay))
+            mVerifyTimeout = delay < 1000 ? 1000 : (delay > 30000 ? 30000 : delay);
     }
     return result;
 }
@@ -331,8 +347,9 @@ bool BrcmPatchRAM::start(IOService *provider)
             OSSafeReleaseNULL(mRecoveryLoop);
     }
 
-    publishStatus("BPR-Config", "attempts=%u steptimeout=%u hide=%d wakeprobe=%d portreset=%d testprobefail=%d",
-                  (unsigned)mMaxAttempts, (unsigned)mStepTimeout, mHideInterfaces, mWakeProbe, mAllowPortReset, mTestProbeFail);
+    publishStatus("BPR-Config", "attempts=%u steptimeout=%u hide=%d wakeprobe=%d portreset=%d testprobefail=%d verify=%d verifytimeout=%u",
+                  (unsigned)mMaxAttempts, (unsigned)mStepTimeout, mHideInterfaces, mWakeProbe, mAllowPortReset, mTestProbeFail,
+                  mVerifyHCI, (unsigned)mVerifyTimeout);
 
     IOLockLock(mUploadLock);
     mUploadOk = uploadWithRetries();
@@ -690,6 +707,191 @@ void BrcmPatchRAM::recoveryTimerFired(IOTimerEventSource*)
     }
 }
 
+/*
+ * Sleep on mCompletionLock (held by the caller) until *flag is set or ms have passed.
+ * Returns whether the flag was set.
+ */
+static bool waitForFlag(IOLock* lock, volatile bool* flag, void* event, UInt32 ms)
+{
+    uint64_t deadline;
+    clock_interval_to_deadline(ms, kMillisecondScale, &deadline);
+    while (!*flag) {
+        if (IOLockSleepDeadline(lock, event, deadline, THREAD_UNINT) == THREAD_TIMED_OUT && !*flag)
+            return false;
+    }
+    return true;
+}
+
+/*
+ * Called from readCompletion (mCompletionLock held) while the controller is being verified.
+ * Only the Read Local Version reply matters, everything else is counted and discarded.
+ */
+void BrcmPatchRAM::verifyParse(void* response, UInt16 length)
+{
+    HCI_RESPONSE* header = (HCI_RESPONSE*)response;
+    UInt8* bytes = (UInt8*)response;
+    UInt16 opcode = 0;
+
+    if (length >= sizeof(HCI_COMMAND_COMPLETE) && header->eventCode == HCI_EVENT_COMMAND_COMPLETE) {
+        HCI_COMMAND_COMPLETE* event = (HCI_COMMAND_COMPLETE*)response;
+        opcode = event->opcode;
+
+        // A second reply (the request is repeated while the chip is silent) counts as stray.
+        if (opcode == HCI_OPCODE_READ_LOCAL_VERSION && !mVerifyGotVersion) {
+            mVerifyOpStatus = event->status;
+            // status, HCI version, HCI revision (2), LMP version, manufacturer (2), LMP subversion (2)
+            if (event->status == 0 && length >= 14) {
+                mVerifyHciVersion = bytes[6];
+                mVerifyHciRevision = (UInt16)(bytes[7] | (bytes[8] << 8));
+                mVerifyLmpVersion = bytes[9];
+                mVerifyManufacturer = (UInt16)(bytes[10] | (bytes[11] << 8));
+                mVerifyLmpSubversion = (UInt16)(bytes[12] | (bytes[13] << 8));
+            }
+            mVerifyGotVersion = true;
+            return;
+        }
+    }
+
+    mVerifyLastStrayOpcode = opcode;
+    mVerifyLastStrayEvent = length >= 1 ? header->eventCode : 0;
+    mVerifyStray++;
+    AlwaysLog("[%04x:%04x]: Verify: discarding stray event 0x%02x (opcode 0x%04x, %d bytes).\n",
+              mVendorId, mProductId, mVerifyLastStrayEvent, opcode, length);
+}
+
+/*
+ * Abort the interrupt read that is still queued and wait for its completion.
+ * The caller holds mCompletionLock and must have a read pending (queued, not completed).
+ */
+void BrcmPatchRAM::abortPendingRead()
+{
+    // The completion handler takes the lock, so drop it meanwhile.
+    IOLockUnlock(mCompletionLock);
+    mInterruptPipe.abort();
+    IOLockLock(mCompletionLock);
+
+    if (!waitForFlag(mCompletionLock, &mReadDone, this, 2000))
+        AlwaysLog("[%04x:%04x]: Verify: pending read did not complete after abort.\n", mVendorId, mProductId);
+}
+
+/*
+ * Make sure the controller really runs its firmware and is quiet before the native Bluetooth
+ * stack may see it. Runs after a successful upload, while our interface is open and the USB
+ * interfaces are still hidden from bluetoothd.
+ *
+ *  1. Keep one interrupt read queued so that nothing the chip emits stays behind for bluetoothd.
+ *  2. Send HCI Read Local Version and repeat it every kVerifyTryMs: a command that reaches the
+ *     chip while it is still rebooting its firmware is simply lost.
+ *  3. Discard every event that is not the reply (e.g. an unsolicited Reset completion).
+ *  4. After the reply, require kVerifyQuietMs of silence (late events are drained too).
+ *
+ * Returns false if the chip stays silent for mVerifyTimeout ms or the pipe breaks.
+ */
+bool BrcmPatchRAM::verifyControllerReady()
+{
+    // Without a read buffer there is nothing to verify with, do not hold the handover back for that.
+    if (!mCompletionLock || !mReadBuffer)
+        return true;
+
+    const uint64_t start = uptimeMs();
+    UInt32 sent = 0;
+    UInt32 drained = 0;
+    bool pending = false;   // a read is queued and has not completed yet
+    bool ok = false;
+
+    IOLockLock(mCompletionLock);
+    mVerifyMode = true;
+    mVerifyGotVersion = false;
+    mVerifyStray = 0;
+    mVerifyLastStrayOpcode = 0;
+    mVerifyLastStrayEvent = 0;
+    mVerifyReadStatus = kIOReturnSuccess;
+    mVerifyOpStatus = 0;
+    mReadDone = false;
+
+    pending = continuousRead();
+
+    while (pending && !mShuttingDown && !mVerifyGotVersion && uptimeMs() - start < mVerifyTimeout) {
+        sent++;
+
+        IOLockUnlock(mCompletionLock);
+        IOReturn result = hciCommand(HCI_LOCAL_VERSION, sizeof(HCI_LOCAL_VERSION));
+        IOLockLock(mCompletionLock);
+
+        if (result != kIOReturnSuccess)
+            break;
+
+        // Collect events until the reply is in or this try has run out; the read stays queued across tries.
+        const uint64_t tryEnd = uptimeMs() + kVerifyTryMs;
+        while (pending && !mVerifyGotVersion) {
+            const uint64_t now = uptimeMs();
+            if (now >= tryEnd || !waitForFlag(mCompletionLock, &mReadDone, this, (UInt32)(tryEnd - now)))
+                break;
+
+            // A read completed: an event, or a failure.
+            pending = false;
+            IOReturn readStatus = mVerifyReadStatus;
+            if (readStatus != kIOReturnSuccess) {
+                // A stalled pipe or a timeout can be retried, anything else (device gone, aborted) cannot.
+                if (readStatus != kIOReturnNotResponding && readStatus != kIOUSBTransactionTimeout)
+                    break;
+                mVerifyReadStatus = kIOReturnSuccess;
+            }
+            if (!mVerifyGotVersion) {
+                mReadDone = false;
+                pending = continuousRead();
+            }
+        }
+    }
+
+    if (mVerifyGotVersion && mVerifyReadStatus == kIOReturnSuccess) {
+        // The chip answers. Wait until it has also stopped talking, any late event is eaten here.
+        while (!mShuttingDown) {
+            if (!pending) {
+                mReadDone = false;
+                if (!(pending = continuousRead()))
+                    break;
+            }
+            if (!waitForFlag(mCompletionLock, &mReadDone, this, kVerifyQuietMs))
+                break;                      // quiet: settled (the read is still queued, aborted below)
+
+            pending = false;
+            IOReturn readStatus = mVerifyReadStatus;
+            if (readStatus == kIOReturnNotResponding || readStatus == kIOUSBTransactionTimeout)
+                mVerifyReadStatus = kIOReturnSuccess;
+            else if (readStatus != kIOReturnSuccess)
+                break;
+            if (++drained >= kVerifyMaxDrain) {
+                AlwaysLog("[%04x:%04x]: Verify: controller keeps sending events, giving up waiting for silence.\n", mVendorId, mProductId);
+                break;
+            }
+        }
+        ok = mVerifyReadStatus == kIOReturnSuccess;
+    }
+
+    const IOReturn finalStatus = mVerifyReadStatus;
+    if (pending)
+        abortPendingRead();
+    mVerifyMode = false;
+    IOLockUnlock(mCompletionLock);
+
+    const uint64_t took = uptimeMs() - start;
+
+    if (ok) {
+        AlwaysLog("[%04x:%04x]: Controller verified in %llu ms (%u request(s), %u stray event(s)): HCI v%u rev 0x%04x, LMP v%u sub 0x%04x, manufacturer 0x%04x.\n",
+                  mVendorId, mProductId, took, (unsigned)sent, (unsigned)mVerifyStray,
+                  mVerifyHciVersion, mVerifyHciRevision, mVerifyLmpVersion, mVerifyLmpSubversion, mVerifyManufacturer);
+        publishStatus("BPR-LastVerify", "ok in %llu ms, tries=%u stray=%u hci=%u/0x%04x lmpsub=0x%04x uptime %llu ms",
+                      took, (unsigned)sent, (unsigned)mVerifyStray, mVerifyHciVersion, mVerifyHciRevision, mVerifyLmpSubversion, uptimeMs());
+    } else {
+        AlwaysLog("[%04x:%04x]: Controller did not answer Read Local Version (%llu ms, %u request(s), %u stray event(s), last read status 0x%08x).\n",
+                  mVendorId, mProductId, took, (unsigned)sent, (unsigned)mVerifyStray, finalStatus);
+        publishStatus("BPR-LastVerify", "FAILED after %llu ms, tries=%u stray=%u readstatus=0x%08x uptime %llu ms",
+                      took, (unsigned)sent, (unsigned)mVerifyStray, finalStatus, uptimeMs());
+    }
+    return ok;
+}
+
 bool BrcmPatchRAM::uploadWithRetries()
 {
     for (UInt32 attempt = 1; attempt <= mMaxAttempts; attempt++) {
@@ -717,15 +919,26 @@ bool BrcmPatchRAM::uploadWithRetries()
 
     publishStatus("BPR-LastUpload", "FAILED after %u attempts, uptime %llu ms", (unsigned)mMaxAttempts, uptimeMs());
 
-    // Last resort. The reset runs in its own thread, so it is safe to request it from here.
-    if (mAllowPortReset && !mShuttingDown)
-        requestReset("all upload attempts failed");
+    /*
+     * Last resort. The reset runs in its own thread, so it is safe to request it from here.
+     * A controller that took the firmware but then stays silent is reset even without
+     * bpr_portreset: handing it to bluetoothd would only start a crash loop. Both are capped
+     * by the shared reset limit.
+     */
+    if (!mShuttingDown) {
+        if (mVerifyFailedLast)
+            requestReset("controller not answering after upload");
+        else if (mAllowPortReset)
+            requestReset("all upload attempts failed");
+    }
     return false;
 }
 
 bool BrcmPatchRAM::uploadFirmwareOnce()
 {
     bool ok = false;
+
+    mVerifyFailedLast = false;
 
     // signal to timer that firmware already loaded
     mDevice.setProperty(kFirmwareLoaded, true);
@@ -758,6 +971,14 @@ bool BrcmPatchRAM::uploadFirmwareOnce()
                     AlwaysLog("[%04x:%04x]: Firmware upgrade completed successfully.\n", mVendorId, mProductId);
                 } else {
                     AlwaysLog("[%04x:%04x]: Firmware upgrade not needed.\n", mVendorId, mProductId);
+                }
+
+                // The upload is done, but the chip may still be rebooting into the new firmware.
+                // Check that it answers and is quiet while bluetoothd cannot see it yet.
+                if (mVerifyHCI && !mShuttingDown && !verifyControllerReady()) {
+                    ok = false;
+                    mVerifyFailedLast = true;
+                    AlwaysLog("[%04x:%04x]: Controller not ready after the upload, treating this attempt as failed.\n", mVendorId, mProductId);
                 }
             } else {
                 AlwaysLog("[%04x:%04x]: Firmware upgrade failed.\n", mVendorId, mProductId);
@@ -983,12 +1204,18 @@ void BrcmPatchRAM::readCompletion(void* target, void* parameter, IOReturn status
     switch (status)
     {
         case kIOReturnSuccess:
-            me->hciParseResponse(me->mReadBuffer->getBytesNoCopy(), bytesTransferred, NULL, NULL);
+            if (me->mVerifyMode)
+                me->verifyParse(me->mReadBuffer->getBytesNoCopy(), bytesTransferred);
+            else
+                me->hciParseResponse(me->mReadBuffer->getBytesNoCopy(), bytesTransferred, NULL, NULL);
             break;
             
         case kIOReturnAborted:
-            AlwaysLog("[%04x:%04x]: readCompletion - Return aborted (0x%08x)\n", me->mVendorId, me->mProductId, status);
-            me->mDeviceState = kUpdateAborted;
+            // Verification aborts its own pending read on purpose, that is not worth a log line or a state change.
+            if (!me->mVerifyMode) {
+                AlwaysLog("[%04x:%04x]: readCompletion - Return aborted (0x%08x)\n", me->mVendorId, me->mProductId, status);
+                me->mDeviceState = kUpdateAborted;
+            }
             break;
             
         case kIOReturnNoDevice:
@@ -1010,6 +1237,10 @@ void BrcmPatchRAM::readCompletion(void* target, void* parameter, IOReturn status
             me->mDeviceState = kUpdateAborted;
             break;
     }
+
+    // Verification needs to tell a failed read from an event.
+    if (me->mVerifyMode && status != kIOReturnSuccess)
+        me->mVerifyReadStatus = status;
 
     me->mReadDone = true;
     IOLockUnlock(me->mCompletionLock);

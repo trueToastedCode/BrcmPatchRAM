@@ -1,6 +1,7 @@
 BrcmPatchRAM Changelog
 ======================
 #### Unreleased
+- BrcmPatchRAM3: verify the controller after the firmware upload and before revealing the USB interfaces (HCI `Read Local Version`, stray events discarded, silence required), so `bluetoothd` does not start its HCI init while the chip may still be busy with the new firmware (`bpr_verify`, `bpr_verifytimeout`, `BPR-LastVerify`)
 - BrcmPatchRAM3: bounded waits for device replies, several upload attempts and background recovery after a failed upload
 - BrcmPatchRAM3: keep USB interfaces unregistered during the firmware upload so `bluetoothd` cannot interfere (`bpr_hide`)
 - BrcmPatchRAM3: check the device after wake and re-enumerate it if it is dead (`bpr_wakeprobe`)
