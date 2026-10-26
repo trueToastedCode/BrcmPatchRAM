@@ -74,7 +74,7 @@ static const uint64_t kResetForgetMs = 10 * 60 * 1000;
 #define kVerifyTryMs 750
 // After the controller answered: how long it has to stay silent before it counts as settled (ms), and the
 // maximum number of late events that are drained before giving up waiting for silence.
-#define kVerifyQuietMs 250
+#define kVerifyQuietMs 0   /* a drain phase that aborts a queued read broke the native transport attach on boot */
 #define kVerifyMaxDrain 8
 
 static uint64_t uptimeMs()
@@ -786,7 +786,8 @@ void BrcmPatchRAM::abortPendingRead()
  *  2. Send HCI Read Local Version and repeat it every kVerifyTryMs: a command that reaches the
  *     chip while it is still rebooting its firmware is simply lost.
  *  3. Discard every event that is not the reply (e.g. an unsolicited Reset completion).
- *  4. After the reply, require kVerifyQuietMs of silence (late events are drained too).
+ *  4. Optionally (bpr_verifyquiet > 0) require that much silence after the reply. Off by default:
+ *     it leaves a read queued that must be aborted, and then the native transport did not attach.
  *
  * Returns false if the chip stays silent for mVerifyTimeout ms or the pipe breaks.
  */

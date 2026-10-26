@@ -149,7 +149,7 @@ private:
      * once it answers.
      */
     bool mVerifyHCI = true;              // boot-arg bpr_verify=0 disables
-    UInt32 mVerifyQuiet = 250;           // boot-arg bpr_verifyquiet: ms of silence required after the reply (0 = skip)
+    UInt32 mVerifyQuiet = 0;             // boot-arg bpr_verifyquiet: ms of silence required after the reply (0 = skip)
     UInt32 mVerifyTimeout = 6000;        // boot-arg bpr_verifytimeout: total ms to wait for the controller to answer
     volatile bool mVerifyMode = false;   // readCompletion routes events to verifyParse (protected by mCompletionLock)
     volatile bool mVerifyGotVersion = false; // a Command Complete for Read Local Version arrived
