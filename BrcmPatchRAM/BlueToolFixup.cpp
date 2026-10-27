@@ -190,12 +190,23 @@ static const char boardIdsWithUSBBluetooth[][kBoardIdSize] = {
 
 
 /**
- * Patch for the new bluetooth stack since Monterey
- * bluetoothd was searching for a static USB Product name but most USB Broadcom don't match this one
- * so we're patching using NVRAM variable (btlfx-product-name)
- * It isn't the best fix but should work for now
+ * Make bluetoothd treat the Broadcom USB adapter as the internal module instead of a third party dongle.
+ *
+ * bluetoothd (Found_USB_Dongle and GetProductAndVendorID) compares, every time it looks for its controller,
+ * the "USB Product Name" IORegistry property of each Bluetooth USB device with the literal
+ * "Bluetooth USB Host Controller" (Apple's internal module). When equal, the device is not considered an external
+ * dongle and the chipset is identified from the controller itself (e.g. BCM_20702A3).
+ * The literal is replaced with the name the adapter really reports, so the comparison is still done by bluetoothd on
+ * every read: the adapter is only treated as internal when it currently reports that exact name (for example not
+ * while it is in a state where it reports something else), and any other device is handled as before.
  */
 static const char kBluetoothUSBHostControllerOriginal[] = "Bluetooth USB Host Controller";
+// Required with -btlfxchipsetdetection (btlfxrealname="..."), there is no default
+static char gRealUSBProductName[sizeof(kBluetoothUSBHostControllerOriginal)] = {};
+// Resolved once, when the first page of bluetoothd is patched (the NVRAM is not readable yet while the plugin starts):
+// 0 = not resolved yet, 1 = name available, 2 = not available (patch disabled)
+static UInt32 gRealNameState = 0;
+static IOLock *gRealNameLock = nullptr;
 
 /**
  * Bypass the Apple proprietary procol which isn't supported on stock BCM cards
@@ -303,14 +314,37 @@ static bool readNvramVariable(const char *fullName, const char16_t *unicodeName,
     return false;
 }
 
-void pad_with_null(char *buf, size_t target_size)
-{
-    size_t len = strlen(buf);
-
-    if (len >= target_size)
-        return;
-
-    memset(buf + len, '\0', target_size - len);
+// btlfxrealname: NVRAM variable under the Lilu GUID. Resolved only once.
+static bool resolveRealUSBProductName() {
+    if (gRealNameLock)
+        IOLockLock(gRealNameLock);
+    if (gRealNameState == 0) {
+        constexpr size_t maxLength = sizeof(gRealUSBProductName) - 1;
+        char name[64] {};
+        // Read the same way btlfx-product-name was read (raw bytes, the last byte of name stays 0)
+        bool haveName = readNvramVariable(NVRAM_PREFIX(LILU_VENDOR_GUID, "btlfxrealname"), u"btlfxrealname", &EfiRuntimeServices::LiluVendorGuid, name, sizeof(name) - 1) && name[0];
+        bool printable = haveName;
+        for (size_t i = 0; printable && name[i]; i++)
+            printable = name[i] >= 0x20 && name[i] < 0x7F;
+        if (!haveName) {
+            SYSLOG(MODULE_SHORT, "-btlfxchipsetdetection requires the NVRAM variable btlfxrealname (Lilu GUID) set to the USB Product Name of the adapter (max %u characters), chipset detection patch disabled", (unsigned)maxLength);
+            gRealNameState = 2;
+        } else if (!printable) {
+            SYSLOG(MODULE_SHORT, "btlfxrealname does not contain a printable name, chipset detection patch disabled");
+            gRealNameState = 2;
+        } else if (strlen(name) > maxLength) {
+            SYSLOG(MODULE_SHORT, "btlfxrealname is longer than %u characters, chipset detection patch disabled", (unsigned)maxLength);
+            gRealNameState = 2;
+        } else {
+            strlcpy(gRealUSBProductName, name, sizeof(gRealUSBProductName));
+            SYSLOG(MODULE_SHORT, "chipset detection patch enabled for USB Product Name '%s'", gRealUSBProductName);
+            gRealNameState = 1;
+        }
+    }
+    bool ok = gRealNameState == 1;
+    if (gRealNameLock)
+        IOLockUnlock(gRealNameLock);
+    return ok;
 }
 
 #pragma mark - Kernel patching code
@@ -363,20 +397,14 @@ static void patched_cs_validate_page(vnode_t vp, memory_object_t pager, memory_o
             if (shouldPatchAddress)
                 searchAndPatchWithMask(data, PAGE_SIZE, path, kSkipAddressCheckOriginal, kSkipAddressCheckMask, kSkipAddressCheckPatched, kSkipAddressCheckMask);
             
-            if (shouldPatchChipsetDetection) {
-                char usbProductName[29];
-                
-                if (readNvramVariable(NVRAM_PREFIX(LILU_VENDOR_GUID, "btlfx-product-name"), u"btlfx-product-name", &EfiRuntimeServices::LiluVendorGuid, usbProductName, sizeof(usbProductName))) {
-                    SYSLOG(MODULE_SHORT, "Patching chipset for new Bluetooth stack");
-                    pad_with_null(usbProductName, sizeof(usbProductName));
-                    searchAndPatch(data, PAGE_SIZE, path, kBluetoothUSBHostControllerOriginal, sizeof(kBluetoothUSBHostControllerOriginal), usbProductName, sizeof(usbProductName));
-                    
-                    searchAndPatchWithMask(data, PAGE_SIZE, path, kBypassVSCErrorOriginal, kBypassVSCErrorMask, kBypassVSCErrorPatched, kBypassVSCErrorMask);
-                    
-                    searchAndPatchWithMask(data, PAGE_SIZE, path, kForceFallbackOriginal, kForceFallbackMask, kForceFallbackPatched, kForceFallbackMask);
-                } else {
-                    SYSLOG(MODULE_SHORT, "Cannot read USB Product Name NVRAM variable. Ignoring patch");
-                }
+            if (shouldPatchChipsetDetection && resolveRealUSBProductName()) {
+                // The name comparison itself stays in bluetoothd (see above)
+                searchAndPatch(data, PAGE_SIZE, path, kBluetoothUSBHostControllerOriginal, sizeof(kBluetoothUSBHostControllerOriginal), gRealUSBProductName, sizeof(gRealUSBProductName));
+
+                // Do not fail the HCI initialization on Apple only VSCs that stock BCM adapters do not support
+                searchAndPatchWithMask(data, PAGE_SIZE, path, kBypassVSCErrorOriginal, kBypassVSCErrorMask, kBypassVSCErrorPatched, kBypassVSCErrorMask);
+                searchAndPatchWithMask(data, PAGE_SIZE, path, kForceFallbackOriginal, kForceFallbackMask, kForceFallbackPatched, kForceFallbackMask);
+
             }
         }
     }
@@ -411,6 +439,8 @@ static void pluginStart() {
             shouldPatchNvramCheck = checkKernelArgument("-btlfxnvramcheck");
         
         shouldPatchChipsetDetection = checkKernelArgument("-btlfxchipsetdetection");
+        if (shouldPatchChipsetDetection)
+            gRealNameLock = IOLockAlloc();
         
         KernelPatcher::RouteRequest csRoute = KernelPatcher::RouteRequest("_cs_validate_page", patched_cs_validate_page, orig_cs_validate);
         if (!patcher.routeMultipleLong(KernelPatcher::KernelID, &csRoute, 1))
