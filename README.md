@@ -181,6 +181,29 @@ You will need to set the following NVRAM variables through your bootloader for a
 
 It is recommended to do it through OpenCore NVRAM section. On macOS 14 and older it is possible to achieve the same with `-btlfxnvramcheck` boot argument, but it is much less efficient.
 
+#### Detecting a Broadcom USB adapter as the internal chipset (`-btlfxchipsetdetection`)
+
+Unless `bluetoothd` considers a Bluetooth USB device to be Apple's internal module, it treats it as an external dongle (`Chipset: THIRD_PARTY_DONGLE` in System Information) and does not identify the chip from the controller. `bluetoothd` decides this by comparing the `USB Product Name` of the device with the literal `Bluetooth USB Host Controller`. With `-btlfxchipsetdetection` that literal is replaced by the name your adapter really reports, so the adapter is considered internal and the chipset is read from the controller (for example `BCM_20702A3`). The comparison stays in `bluetoothd` and is done on every read, so only a device reporting exactly that name is treated this way. The patch for the Apple only VSC that stock Broadcom adapters reject (`HCI initialization failed`) is applied with it.
+
+To use it:
+
+1. Add the boot argument `-btlfxchipsetdetection`.
+2. Find the name your adapter reports, for example with `ioreg -l -w0 | grep "USB Product Name"` (look at the Broadcom device, e.g. `Broadcom 20702 Bluetooth 4.0`).
+3. Set the NVRAM variable `btlfxrealname` **as data** (the bytes of the name, not a string) under the Lilu GUID:
+
+    * `4D1FDA02-38C7-4A6A-9CC6-4BCCA8B30102:btlfxrealname` — `42726F6164636F6D20323037303220426C7565746F6F746820342E30` (for `Broadcom 20702 Bluetooth 4.0`)
+
+    In OpenCore this is `NVRAM` → `Add` → `4D1FDA02-38C7-4A6A-9CC6-4BCCA8B30102` → `btlfxrealname` of type `Data`.
+
+4. Reboot. `Chipset` in System Information should now show the real chip instead of `THIRD_PARTY_DONGLE`.
+
+Notes:
+
+* The name is not a spoof name, it has to be what the adapter currently reports (see step 2). It can have at most 29 characters (no terminating zero byte is needed).
+* If `btlfxrealname` is missing, empty, longer than 29 characters or not printable text, the patch is not applied (`-btlfxchipsetdetection` alone does nothing).
+* The name is read once, when `bluetoothd` is first patched after boot, so changes need a reboot.
+* The patches were verified against macOS 15.7.9 only.
+
 ### Supported Devices
 
 BrcmPatchRAM supports any Broadcom USB bluetooth device based on the BCM20702 chipset (possibly other chipsets are supported also, but this has not been tested).
